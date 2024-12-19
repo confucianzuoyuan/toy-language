@@ -1,0 +1,14 @@
+// should print 0 .. 10
+for i := 0 upto 10 do {
+write i;
+write "\n"
+};
+// should print 0 .. 4
+for i := 0 upto 10 do {
+if i > 4 then break else skip;
+write i;
+write "\n"
+};
+write "Should print\n";
+break;
+write "Should not print\n"
