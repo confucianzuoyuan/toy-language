@@ -10,5 +10,6 @@ while 0 < x do {
  };     
  y := start;
  x := x - 1
+ write(x)
 }
 

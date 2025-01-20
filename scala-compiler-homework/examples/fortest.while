@@ -1,3 +1,5 @@
-for i := 2 upto 4 do {
-  write i
+for i := 1 upto 10 do {
+  for i := 1 upto 10 do {
+    write i
+  }
 }

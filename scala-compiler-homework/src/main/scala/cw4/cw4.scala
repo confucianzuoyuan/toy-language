@@ -365,6 +365,7 @@ type Block = List[Stmt]
 case object Skip extends Stmt
 case class If(a: BExp, bl1: Block, bl2: Block) extends Stmt
 case class While(b: BExp, bl: Block) extends Stmt
+case class For(init: Stmt, cond: BExp, post: Stmt, body: Block) extends Stmt
 case class Assign(s: String, a: AExp) extends Stmt
 case class Read(s: String) extends Stmt
 case class WriteId(s: String) extends Stmt  // for printing values of variables
@@ -456,14 +457,13 @@ lazy val AExp: Parser[List[Token], AExp] = E
 
 lazy val BExp: Parser[List[Token], BExp] = A
 
-lazy val ForStmt: Parser[List[Token], Block] =
+lazy val ForStmt: Parser[List[Token], Stmt] =
   (p("for") ~ VarParser ~ p(":=") ~ AExp ~ p("upto") ~ AExp ~ p("do") ~ Block).map {
     case (((((((a, Var(b)), c), d), e), f), g), h) => {
       val init = Assign(b, d)
       val cond = Bop("<=", Var(b), f)
       val post = Assign(b, Aop("+", Var(b), Num(1)))
-      val body = h ++ List(post)
-      List(init, While(cond, body))
+      For(init, cond, post, h)
     }
   }
 
@@ -478,16 +478,13 @@ lazy val Stmt: Parser[List[Token], Stmt] =
     || p("break").map { x => BreakStmt }
     || (p("while") ~ BExp ~ p("do") ~ Block).map{ case (((x, y), z), w) => While(y, w)}
     || (p("if") ~ BExp ~ p("then") ~ (Stmts || Block) ~ p("else") ~ (Stmts || Block)).map{ case (((((u, v), w), x), y), z) => If(v, x, z)}
+    || ForStmt
 
 lazy val Stmts: Parser[List[Token], Block] =
   (Stmt ~ p(";") ~ Stmts).map{ case ((x, y), z) => x :: z }
     || (Stmt ~ p(";")).map{ case (x, y) => List(x)}
     || (Stmt ~ Stmts).map{ case (x, y) => x :: y}
     || Stmt.map{x => List(x)}
-    || (ForStmt ~ p(";") ~ Stmts).map{ case ((x, y), z) => x ::: z }
-    || (ForStmt ~ Stmts).map{ case (x, y) => x ::: y}
-    || (ForStmt ~ p(";")).map{ case (x, y) => x }
-    || ForStmt
 
 lazy val Block: Parser[List[Token], Block] =
   (p("{") ~ Stmts ~ p("}")).map{ case ((x, y), z) => y}
@@ -495,7 +492,26 @@ lazy val Block: Parser[List[Token], Block] =
 
 // Bytecode Compiler
 // ==========
-type Env = Map[String, Int]
+type Env = List[Map[String, Int]]
+
+def find_var(v: String, env: Env): Option[Int] = {
+  for (e <- env) {
+    e.get(v) match {
+      case Some(i) => return Some(i)
+      case None => ()
+    }
+  }
+  None
+}
+
+def put_var(v: String, env: Env): (Int, Env) = {
+  var sz = 0
+  for (e <- env) {
+    sz += e.size
+  }
+  val idx = env.head.getOrElse(v, sz)
+  (idx, env.updated(0, env.head + (v -> idx)))
+}
 
 var label_count = 0
 
@@ -507,7 +523,7 @@ var brk_label : Option[String] = None
 
 def compile_aexp(a: AExp, env: Env): String = a match {
   case Num(i) => s"  ldc ${i}\n"
-  case Var(s) => env.get(s) match {
+  case Var(s) => find_var(s, env) match {
     case Some(i) => s"  iload ${i}\n"
     case None => throw new RuntimeException("var not in env: " + s)
   }
@@ -553,7 +569,7 @@ def compile_stmt(stmt: Stmt, env: Env): (String, Env) = stmt match {
     var instr = s"  ldc ${s}\n"
     instr += "  invokestatic test/test/writes(Ljava/lang/String;)V\n"
     (instr, env)
-  case WriteId(var_name) => env.get(var_name) match {
+  case WriteId(var_name) => find_var(var_name, env) match {
     case Some(i) =>
       var instr = s"  iload ${i}\n"
       instr += "  invokestatic test/test/write(I)V\n"
@@ -562,14 +578,16 @@ def compile_stmt(stmt: Stmt, env: Env): (String, Env) = stmt match {
   }
   case Read(var_name) =>
     var instr = "  invokestatic test/test/read()I\n"
-    val idx = env.getOrElse(var_name, env.size)
+    val r = put_var(var_name, env)
+    val idx = r._1
     instr += s"  istore ${idx}\n"
-    (instr, env + (var_name -> idx))
+    (instr, r._2)
   case Assign(var_name, a) =>
     var instr = compile_aexp(a, env)
-    val idx = env.getOrElse(var_name, env.size)
+    val r = put_var(var_name, env)
+    val idx = r._1
     instr += s"  istore ${idx}\n"
-    (instr, env + (var_name -> idx))
+    (instr, r._2)
   case If(a, bl1, bl2) =>
     val c = count()
     val Label_ifelse = "L.ifelse." + c
@@ -592,13 +610,36 @@ def compile_stmt(stmt: Stmt, env: Env): (String, Env) = stmt match {
     brk_label = Some(Label_wend)
     val (is, env1) = compile_bl(bl, env)
     var instr = Label_wbegin + ":\n"
-    instr += compile_bexp(b, env, Label_wend)
+    instr += compile_bexp(b, env1, Label_wend)
     instr += is
     instr += "  goto " + Label_wbegin + "\n"
     instr += Label_wend + ":\n"
     val result = (instr, env1)
     brk_label = old_brk_lbl
     result
+  case For(init, cond, post, body) => {
+    val new_env = Map() :: env
+    val c = count()
+    val Label_wbegin = "L.wbegin." + c
+    val Label_wend = "L.wend." + c
+    val old_brk_lbl = brk_label
+    brk_label = Some(Label_wend)
+    val init_ = compile_stmt(init, new_env)
+    val cond_ = compile_bexp(cond, init_._2, Label_wend)
+    val body_ = compile_bl(body, init_._2)
+    val post_ = compile_stmt(post, body_._2)
+
+    var instr = init_._1
+    instr += (Label_wbegin + ":\n")
+    instr += cond_
+    instr += body_._1
+    instr += post_._1
+    instr += "  goto " + Label_wbegin + "\n"
+    instr += Label_wend + ":\n"
+    val result = (instr, env)
+    brk_label = old_brk_lbl
+    result
+  }
   case BreakStmt => brk_label match {
     case Some(lab) => (s"  goto ${lab}\n", env)
     case None => ("  return\n", env)
@@ -616,13 +657,13 @@ def compile_bl(bl: Block, env: Env) : (String, Env) = {
   (instr, e)
 }
 
-def compile(bl: Block) : String = {
+def compile(bl: Block, class_name: String) : String = {
   var asm = ""
   asm += (
-    """
-      |.class public test.test
-      |.super java/lang/Object
-      |""".stripMargin)
+    s"""
+       |.class public ${class_name}
+       |.super java/lang/Object
+       |""".stripMargin)
   asm += (
     """
       |.method public static write(I)V
@@ -690,7 +731,7 @@ def compile(bl: Block) : String = {
       |  .limit locals 200
       |  .limit stack 200
       |""".stripMargin)
-  val result = compile_bl(bl, Map())
+  val result = compile_bl(bl, List(Map()))
   asm += result._1
   asm += (
     """
@@ -700,17 +741,17 @@ def compile(bl: Block) : String = {
   asm
 }
 
-@main
-def test = {
-  var file: String = "primes.while"
-  val contents = os.read(os.pwd / "examples" / file)
-  println(s"Lex $file: ")
-  val tks = tokenise(contents)
-  println(tks.mkString(","))
-  println(s"Parse $file: ")
-  val ast = Stmts.parse_all(tks).head
-  println(ast)
-  println(s"Compile $file: ")
-  println("=========== assembly code ====================\n\n")
-  println(compile(ast))
-}
+ @main
+ def test = {
+   var file: String = "fortest.while"
+   val contents = os.read(os.pwd / "examples" / file)
+   println(s"Lex $file: ")
+   val tks = tokenise(contents)
+   println(tks.mkString(","))
+   println(s"Parse $file: ")
+   val ast = Stmts.parse_all(tks).head
+   println(ast)
+   println(s"Compile $file: ")
+   println("=========== assembly code ====================\n\n")
+   println(compile(ast, "primes"))
+ }
